@@ -12,68 +12,71 @@ class PDDE:
     def __init__(self, caso=None):
         if caso is None:
             caso = self.definir_caso()
-        self.relatorio_completo = []  # Armazenar relatório de todas as operações
+        self.relatorio_completo = []
         self.executar_pdde(caso)
-    
+
     def definir_caso(self):
         """Define o caso com 3 UHEs - 2 reservatórios + 1 fio d'água com baixa produtividade"""
         return {
-            'DGer': {
-                'CDef': 500.0,
-                'Carga': [50.0, 50.0, 50.0],
-                'Nr_Disc': 5,
-                'Nr_Est': 3,
-                'Nr_Cen': 2
-            },
-            'UHE': [
-                {
-                    'id': 0,
-                    'Nome': 'UHE 1 - Reservatório',
-                    'Vmax': 100.0,
-                    'Vmin': 20.0,
-                    'Prod': 0.95,
-                    'Engol': 60.0,
-                    'Afl': [
-                        [23, 16],
-                        [19, 14], 
-                        [15, 11]
-                    ],
-                    'Tipo': 'reservatorio'
+                'DGer': {
+                    'CDef': 500.0,
+                    'Carga': [50.0, 50.0, 50.0],
+                    'Nr_Disc': 5,
+                    'Nr_Est': 3,
+                    'Nr_Cen': 2
                 },
-                {
-                    'id': 1,
-                    'Nome': 'UHE 2 - Reservatório', 
-                    'Vmax': 120.0,
-                    'Vmin': 25.0,
-                    'Prod': 0.85,
-                    'Engol': 55.0,
-                    'Afl': [
-                        [18, 12],
-                        [16, 10],
-                        [13, 8]
-                    ],
-                    'Tipo': 'reservatorio'
-                },
-                {
-                    'id': 2,
-                    'Nome': 'UHE 3 - Fio dÁgua',
-                    'Vmax': 0.0,
-                    'Vmin': 0.0,
-                    'Prod': 0.50,
-                    'Engol': 50.0,
-                    'Afl': [
-                        [5, 3],
-                        [4, 2],
-                        [3, 1]
-                    ],
-                    'Tipo': 'fio_dagua'
-                }
-            ],
-            'UTE': [
-                {'Nome': 'GT_1', 'Capac': 15.0, 'Custo': 10.0},
-                {'Nome': 'GT_2', 'Capac': 10.0, 'Custo': 25.0}
-            ]
-        }
+                'UHE': [
+                    {
+                        'id': 0,
+                        'Nome': 'UHE 1 - Reservatório',
+                        'Vmax': 100.0,
+                        'Vmin': 20.0,
+                        'Prod': 0.95,
+                        'Engol': 60.0,
+                        'Afl': [
+                            [23, 16],
+                            [19, 14], 
+                            [15, 11]
+                        ],
+                        'Tipo': 'reservatorio',
+                        'Montante': []
+                    },
+                    {
+                        'id': 1,
+                        'Nome': 'UHE 2 - Reservatório', 
+                        'Vmax': 120.0,
+                        'Vmin': 25.0,
+                        'Prod': 0.85,
+                        'Engol': 55.0,
+                        'Afl': [
+                            [18, 12],
+                            [16, 10],
+                            [13, 8]
+                        ],
+                        'Tipo': 'reservatorio',
+                        'Montante': []  
+                    },
+                    {
+                        'id': 2,
+                        'Nome': 'UHE 3 - Fio dÁgua',
+                        'Vmax': 0.0,
+                        'Vmin': 0.0,
+                        'Prod': 0.50,
+                        'Engol': 50.0,
+                        'Afl': [
+                            [5, 3],
+                            [4, 2],
+                            [3, 1]
+                        ],
+                        'Tipo': 'fio_dagua',
+                        'Montante': [1]
+                    }
+                ],
+                'UTE': [
+                    {'Nome': 'GT_1', 'Capac': 15.0, 'Custo': 10.0},
+                    {'Nome': 'GT_2', 'Capac': 10.0, 'Custo': 25.0}
+                ]
+            }
     
     def executar_pdde(self, caso):
         print("=== PDDE ===")
@@ -148,7 +151,7 @@ class PDDE:
                         custo_cenario = max(0.0, custo_cenario)
                         custo_total_acum += custo_cenario
                         
-                        # CORREÇÃO CRÍTICA: Usar os duais reais das restrições de balanço hídrico
+                        # Usar os duais reais das restrições de balanço hídrico
                         for i in range(NUHE):
                             if caso['UHE'][i]['Tipo'] == 'reservatorio':
                                 # Coeficiente NEGATIVO: quanto mais água, menor o custo futuro
@@ -180,7 +183,7 @@ class PDDE:
                         cma_medio[i] = -10.0
                     cmo_medio = caso['DGer']['CDef']
                 
-                # CORREÇÃO: Cálculo robusto do termo independente
+                # Cálculo robusto do termo independente
                 termo_independente = custo_medio
                 for i in uhes_reservatorio:
                     termo_independente -= cma_medio[i] * volume_inicial[i]
@@ -428,12 +431,12 @@ class PDDE:
             
             # Variáveis de decisão
             model.x_volume_final = Var(model.UHE, 
-                                      bounds=lambda m, i: (caso['UHE'][i]['Vmin'], caso['UHE'][i]['Vmax']))
+                                    bounds=lambda m, i: (caso['UHE'][i]['Vmin'], caso['UHE'][i]['Vmax']))
             model.x_volume_turbinado = Var(model.UHE, 
-                                          bounds=lambda m, i: (0, caso['UHE'][i]['Engol']))
+                                        bounds=lambda m, i: (0, caso['UHE'][i]['Engol']))
             model.x_volume_vertido = Var(model.UHE, bounds=(0, None))
             model.x_geracao_termica = Var(model.UTE, 
-                                         bounds=lambda m, i: (0, caso['UTE'][i]['Capac']))
+                                        bounds=lambda m, i: (0, caso['UTE'][i]['Capac']))
             model.x_deficit = Var(bounds=(0, None))
             model.x_alpha = Var(bounds=(0, None))
             
@@ -445,23 +448,32 @@ class PDDE:
             
             model.obj = Objective(rule=objective_rule, sense=minimize)
             
-            # CORREÇÃO: Restrições separadas para cada tipo de usina
+            # Restrições separadas para cada tipo de usina
             def balanco_hidrico_volume_rule(m, i):
                 """Restrição de volume para fio d'água"""
                 if caso['UHE'][i]['Tipo'] == 'fio_dagua':
-                    return m.x_volume_final[i] == 0.0  # Volume sempre zero
+                    return m.x_volume_final[i] == 0.0
                 else:
                     return Constraint.Skip
             
             def balanco_hidrico_operacao_rule(m, i):
                 """Restrição de operação (turbinamento + vertimento)"""
-                if caso['UHE'][i]['Tipo'] == 'fio_dagua':
-                    # Fio d'água: toda água disponível deve ser turbinada ou vertida
-                    return m.x_volume_turbinado[i] + m.x_volume_vertido[i] == afluencia[i]
+                uhe = caso['UHE'][i]
+                
+                if uhe['Tipo'] == 'fio_dagua':
+                    # Fio d'água: calcula a afluência total (natural + contribuição das usinas a montante)
+                    afluencia_total = afluencia[i]
+                    
+                    # Adiciona a contribuição das usinas a montante
+                    for montante_id in uhe['Montante']:
+                        afluencia_total += (m.x_volume_turbinado[montante_id] + 
+                                        m.x_volume_vertido[montante_id])
+                    
+                    return m.x_volume_turbinado[i] + m.x_volume_vertido[i] == afluencia_total
                 else:
                     # Reservatório: balanço tradicional
                     return (m.x_volume_final[i] + m.x_volume_turbinado[i] + m.x_volume_vertido[i] == 
-                           volume_inicial[i] + afluencia[i])
+                        volume_inicial[i] + afluencia[i])
             
             model.balanco_volume = Constraint(model.UHE, rule=balanco_hidrico_volume_rule)
             model.balanco_operacao = Constraint(model.UHE, rule=balanco_hidrico_operacao_rule)
@@ -502,7 +514,7 @@ class PDDE:
                 custo_imediato = max(0, custo_imediato)
                 custo_futuro = max(0, custo_futuro)
                 
-                # CORREÇÃO CRÍTICA: Estimativa mais realista dos CMA
+                # Estimativa mais realista dos CMA
                 cma_duais = []
                 for i in range(nuhe):
                     if caso['UHE'][i]['Tipo'] == 'reservatorio':
@@ -533,24 +545,10 @@ class PDDE:
                 }
             else:
                 print(f'  Status não ótimo: {results.solver.termination_condition}')
-                return self._resultado_inviavel(volume_inicial, nuhe, nute, caso, imes)
-                
+
         except Exception as e:
             print(f"  Erro na otimização: {e}")
-            return self._resultado_inviavel(volume_inicial, nuhe, nute, caso, imes)
-    
-    def _resultado_inviavel(self, volume_inicial, nuhe, nute, caso, imes):
-        return {
-            'status': 'infeasible',
-            'custo_imediato': 1e6,
-            'custo_futuro': 0.0,
-            'cma_duais': [15.0 if caso['UHE'][i]['Tipo'] == 'reservatorio' else 0.0 for i in range(nuhe)],
-            'cmo_dual': caso['DGer']['CDef'],
-            'volumes_finais': volume_inicial,
-            'geracao_termica': [0.0] * nute,
-            'turbinamento': [0.0] * nuhe,
-            'deficit': caso['DGer']['Carga'][imes-1]
-        }
+        
 
     def plota_FuncaoCustoFuturo_3D(self, cortes, caso, imes, uhes_reservatorio):
         """Plota a função de custo futuro como superfície 3D para as 2 usinas com reservatório"""
@@ -600,16 +598,6 @@ class PDDE:
         # Garantir que Z seja completamente não-negativo
         Z = np.maximum(Z, 0.0)
         
-        # CORREÇÃO: Adicionar variação mínima se a superfície estiver muito plana
-        if np.max(Z) - np.min(Z) < 1.0:
-            print("  AVISO: Superfície muito plana, adicionando variação artificial")
-            # Adicionar uma variação quadrática suave para demonstrar a relação
-            for i in range(UHE1.shape[0]):
-                for j in range(UHE1.shape[1]):
-                    vol1_ratio = 1 - (UHE1[i,j] - caso['UHE'][uhe1_idx]['Vmin']) / (caso['UHE'][uhe1_idx]['Vmax'] - caso['UHE'][uhe1_idx]['Vmin'])
-                    vol2_ratio = 1 - (UHE2[i,j] - caso['UHE'][uhe2_idx]['Vmin']) / (caso['UHE'][uhe2_idx]['Vmax'] - caso['UHE'][uhe2_idx]['Vmin'])
-                    Z[i,j] += 50.0 * (vol1_ratio**2 + vol2_ratio**2)
-        
         # Plot 3D
         fig = plt.figure(figsize=(15, 10))
         ax = fig.add_subplot(111, projection='3d')
@@ -636,18 +624,8 @@ class PDDE:
         
         plt.tight_layout()
         plt.show()
-        
-        # Análise da superfície
-        min_volume_idx = np.unravel_index(np.argmax(Z), Z.shape)
-        max_volume_idx = np.unravel_index(np.argmin(Z), Z.shape)
-        
-        print(f"Superfície 3D plotada para estágio {imes}")
-        print(f"Custo MÁXIMO {np.max(Z):.2f} em volumes baixos")
-        print(f"Custo MÍNIMO {np.min(Z):.2f} em volumes altos")
-        print(f"Variação total: {np.max(Z) - np.min(Z):.2f}")
-        
         return True
 
 if __name__ == '__main__':
-    # Executa o PDDE corrigido com sistema de relatórios
+    # Executa o PDDE
     pdde = PDDE()
