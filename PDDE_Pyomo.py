@@ -299,7 +299,8 @@ class PDDE:
             
             print(f"Volumes Iniciais: {[f'{v:.1f}' for v in vol_inicial]}")
             print(f"Volumes Finais:   {[f'{v:.1f}' for v in vol_final_medio]}")
-            print(f"Afluência:        {[f'{entradas_ponto[0]['afluencia'][i]:.1f}' for i in range(len(caso['UHE']))]}")
+            afluencia_value = [f"{entradas_ponto[0]['afluencia'][i]:.1f}" for i in range(len(caso['UHE']))]
+            print(f"Afluência:        {afluencia_value}")
             
             print(f"\nGERAÇÃO HIDRELÉTRICA (MW):")
             for i, uhe in enumerate(caso['UHE']):
