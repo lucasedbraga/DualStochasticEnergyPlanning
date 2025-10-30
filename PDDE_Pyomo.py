@@ -20,8 +20,8 @@ class PDDE:
         return {
                 'DGer': {
                     'CDef': 500.0,
-                    'Carga': [50.0, 50.0, 50.0],
-                    'Nr_Disc': 5,
+                    'Carga': [140.0, 120.0, 80.0],
+                    'Nr_Disc': 3,
                     'Nr_Est': 3,
                     'Nr_Cen': 2
                 },
@@ -441,12 +441,12 @@ class PDDE:
             model.x_alpha = Var(bounds=(0, None))
             
             # Função objetivo
-            def objective_rule(m):
+            def FOB(m):
                 custo_termica = sum(caso['UTE'][i]['Custo'] * m.x_geracao_termica[i] for i in m.UTE)
                 penal_vertim = sum(0.001 * m.x_volume_vertido[i] for i in m.UHE)
                 return custo_termica + penal_vertim + caso['DGer']['CDef'] * m.x_deficit + m.x_alpha
             
-            model.obj = Objective(rule=objective_rule, sense=minimize)
+            model.obj = Objective(rule=FOB, sense=minimize)
             
             # Restrições separadas para cada tipo de usina
             def balanco_hidrico_volume_rule(m, i):
@@ -498,6 +498,7 @@ class PDDE:
                 model.cortes = Constraint(RangeSet(0, len(cortes_validos)-1), rule=cortes_rule)
             
             # Resolver o modelo
+            model.dual = Suffix(direction=Suffix.IMPORT)
             solver = SolverFactory('glpk')
             results = solver.solve(model, tee=False)
             
@@ -514,23 +515,26 @@ class PDDE:
                 custo_imediato = max(0, custo_imediato)
                 custo_futuro = max(0, custo_futuro)
                 
-                # Estimativa mais realista dos CMA
                 cma_duais = []
                 for i in range(nuhe):
-                    if caso['UHE'][i]['Tipo'] == 'reservatorio':
-                        # CMA baseado no custo de oportunidade da água
-                        produtibilidade = caso['UHE'][i]['Prod']
-                        
-                        # Estimativa baseada na relação custo/produtibilidade
-                        # e no déficit do sistema
-                        deficit_ratio = value(model.x_deficit) / caso['DGer']['Carga'][imes-1] if caso['DGer']['Carga'][imes-1] > 0 else 0
-                        custo_oportunidade = (caso['UTE'][0]['Custo'] / produtibilidade) * (1 + deficit_ratio * 2)
-                        
-                        cma_duais.append(custo_oportunidade)
-                    else:
-                        cma_duais.append(0.0)
+                    try:
+                        # Para reservatórios, usar dual da restrição de balanço
+                        if caso['UHE'][i]['Tipo'] == 'reservatorio':
+                            dual_val = model.dual[model.balanco_hidrico[i+1]]
+                            # O dual deve ser negativo (custo de oportunidade)
+                            cma_duais.append(-abs(dual_val) if dual_val is not None else -1.0)
+                        else:
+                            cma_duais.append(0.0)
+                    except:
+                        cma_duais.append(-1.0)  # Valor padrão
                 
-                cmo_dual = caso['DGer']['CDef']
+                # Obter dual da demanda
+                try:
+                    cmo_dual = model.dual[model.demanda]
+                    if cmo_dual is None:
+                        cmo_dual = 0.0
+                except:
+                    cmo_dual = 0.0
                 
                 return {
                     'status': 'optimal',
