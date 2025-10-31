@@ -424,7 +424,7 @@ class PDDE:
         print(f"{'='*100}")
 
     def solve_DespachoEconomico(self, volume_inicial, afluencia, nuhe, nute, imes, caso, cortes):
-        """Resolve o problema de despacho econômico com cálculo correto de duais"""
+        """Resolve o problema de despacho econômico"""
         try:
             model = ConcreteModel()
             
@@ -449,7 +449,7 @@ class PDDE:
                 penal_vertim = sum(0.001 * m.x_volume_vertido[i] for i in m.UHE)
                 return custo_termica + penal_vertim + caso['DGer']['CDef'] * m.x_deficit + m.x_alpha
             
-            model.obj = Objective(rule=FOB, sense=minimize)
+            model.FOB = Objective(rule=FOB, sense=minimize)
             
             # Restrições separadas para cada tipo de usina
             def C_VolFinal_FioDagua(m, i):
@@ -460,11 +460,12 @@ class PDDE:
                     return Constraint.Skip
             
             def C_BalancoHidrico(m, i):
-                """Restrição de operação (turbinamento + vertimento)"""
+                """Restrição de operação"""
                 uhe = caso['UHE'][i]
                 
                 if uhe['Reservatorio'] == False:
-                    # Fio d'água: calcula a afluência total (natural + contribuição das usinas a montante)
+                    # Fio d'água: calcula a afluência total 
+                    # afluencia total = (natural + contribuição das usinas a montante)
                     afluencia_total = afluencia[i]
                     
                     # Adiciona a contribuição das usinas a montante
@@ -493,12 +494,12 @@ class PDDE:
             cortes_validos = [c for c in cortes if c['estagio'] == imes + 1]
             
             if cortes_validos:
-                def GeracaoDeCortes(m, idx):
+                def C_cortes(m, idx):
                     corte = cortes_validos[idx]
                     somatorio = sum(corte['coefs'][i] * m.x_volume_final[i] for i in m.UHE)
                     return m.x_alpha >= somatorio + corte['termo_independente']
                 
-                model.cortes = Constraint(RangeSet(0, len(cortes_validos)-1), rule=GeracaoDeCortes)
+                model.cortes = Constraint(RangeSet(0, len(cortes_validos)-1), rule=C_cortes)
             
             # Resolver o modelo
             model.dual = Suffix(direction=Suffix.IMPORT)
@@ -521,17 +522,13 @@ class PDDE:
                 cma_duais = []
                 for i in range(nuhe):
                     try:
-                        # Para reservatórios, usar dual da restrição de balanço
                         if caso['UHE'][i]['Reservatorio'] == True:
                             dual_val = model.dual[model.balanco_hidrico[i+1]]
-                            # O dual deve ser negativo (custo de oportunidade)
-                            cma_duais.append(-abs(dual_val) if dual_val is not None else -1.0)
+                            cma_duais.append(-abs(dual_val) if dual_val is not None else 0.0)
                         else:
                             cma_duais.append(0.0)
                     except:
-                        cma_duais.append(-1.0)  # Valor padrão
-                
-                # Obter dual da demanda
+                        print("erro")
                 try:
                     cmo_dual = model.dual[model.C_BalancoDePotencia]
                     if cmo_dual is None:
