@@ -523,7 +523,7 @@ class PDDE:
                     try:
                         # Para reservatórios, usar dual da restrição de balanço
                         if caso['UHE'][i]['Reservatorio'] == True:
-                            dual_val = model.dual[model.balanco_hidrico[i+1]]
+                            dual_val = model.dual[model.C_BalancoHidrico[i]]
                             # O dual deve ser negativo (custo de oportunidade)
                             cma_duais.append(-abs(dual_val) if dual_val is not None else -1.0)
                         else:
