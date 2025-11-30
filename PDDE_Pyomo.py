@@ -7,11 +7,12 @@ from pyomo.environ import *
 from pyomo.opt import SolverFactory
 import pandas as pd
 from datetime import datetime
+from scipy.integrate import quad
 
 class PDDE:
     def __init__(self, caso=None):
         if caso is None:
-            caso = self.definir_caso()
+            caso = self.definir_caso_com_produtibilidade_nao_linear()
         self.relatorio_completo = []
         self.executar_pdde(caso)
 
@@ -78,8 +79,246 @@ class PDDE:
                 ]
             }
     
+    def definir_caso_com_produtibilidade_nao_linear(self):
+            """Caso com curvas cota-volume para produtibilidade não linear"""
+            caso = self.definir_caso()
+            
+            for i, uhe in enumerate(caso['UHE']):
+                if uhe['Reservatorio']:
+                    uhe['CotaVol'] = {
+                        'a1': 100.0 + i*20,
+                        'a2': 0.8,
+                        'a3': -0.002,
+                        'a4': 0.00002,
+                        'a5': -0.0000002
+                    }
+                    uhe['Eficiencia'] = 0.85
+                    uhe['CotaFuga'] = 50.0 + i*10
+                    uhe['Perdas'] = 0.5
+                    
+            return caso
+    
+    def calcular_cota_reservatorio(self, uhe, volume):
+        """Calcula cota do reservatório em função do volume"""
+        if not uhe['Reservatorio']:
+            return uhe.get('CotaFuga', 50.0)
+        
+        cv = uhe['CotaVol']
+        return (cv['a1'] + cv['a2']*volume + cv['a3']*volume**2 + 
+                cv['a4']*volume**3 + cv['a5']*volume**4)
+    
+    def calcular_altura_queda_equivalente(self, uhe, volume):
+        """Calcula altura de queda equivalente"""
+        if not uhe['Reservatorio']:
+            return 10.0  # Altura fixa para fio d'água
+        
+        cota_reservatorio = self.calcular_cota_reservatorio(uhe, volume)
+        cota_fuga = uhe.get('CotaFuga', 10.0)
+        perdas = uhe.get('Perdas', 0.5)
+        
+        return max(cota_reservatorio - cota_fuga - perdas, 10.0)
+    
+    def calcular_produtibilidade_instantanea(self, uhe, volume):
+        """Calcula produtibilidade instantânea baseada na altura de queda"""
+        if not uhe['Reservatorio']:
+            return uhe['Prod']
+        
+        altura_queda = self.calcular_altura_queda_equivalente(uhe, volume)
+        eficiencia = uhe.get('Eficiencia', 0.85)
+        
+        # ρ = η × g × H / 1000 [MW/(m³/s)]
+        prod_instantanea = (eficiencia * 9.81 * altura_queda) / 1000.0
+        
+        return max(prod_instantanea, 0.1)
+    
+    def calcular_energia_armazenada(self, uhe, volume):
+        """Calcula energia armazenada integrando a produtibilidade"""
+        if not uhe['Reservatorio']:
+            return 0.0
+        
+        # Integração numérica da energia
+        n_pontos = 20
+        volumes = np.linspace(uhe['Vmin'], volume, n_pontos)
+        energia = 0.0
+        
+        for i in range(1, len(volumes)):
+            v1, v2 = volumes[i-1], volumes[i]
+            rho1 = self.calcular_produtibilidade_instantanea(uhe, v1)
+            rho2 = self.calcular_produtibilidade_instantanea(uhe, v2)
+            energia += 0.5 * (rho1 + rho2) * (v2 - v1)
+        
+        return energia
+    
+    def criar_reservatorio_equivalente(self, caso, volumes):
+        """Cria reservatório equivalente com produtibilidade, cota e altura equivalentes"""
+        
+        uhes_reservatorio = [i for i, uhe in enumerate(caso['UHE']) if uhe['Reservatorio']]
+        uhes_fiodagua = [i for i, uhe in enumerate(caso['UHE']) if not uhe['Reservatorio']]
+        
+        # =============================================================================
+        # 1. CÁLCULO DAS GRANDEZAS EQUIVALENTES
+        # =============================================================================
+        
+        # Volumes totais
+        volume_total = sum(volumes[i] for i in uhes_reservatorio)
+        
+        # Energia armazenada total
+        energia_total = sum(self.calcular_energia_armazenada(caso['UHE'][i], volumes[i]) 
+                          for i in uhes_reservatorio)
+        
+        # Cota equivalente (média ponderada pelo volume)
+        if volume_total > 0:
+            cota_equiv = sum(self.calcular_cota_reservatorio(caso['UHE'][i], volumes[i]) * volumes[i] 
+                           for i in uhes_reservatorio) / volume_total
+        else:
+            cota_equiv = 100.0
+        
+        # Altura de queda equivalente (média ponderada)
+        if volume_total > 0:
+            altura_equiv = sum(self.calcular_altura_queda_equivalente(caso['UHE'][i], volumes[i]) * volumes[i] 
+                             for i in uhes_reservatorio) / volume_total
+        else:
+            altura_equiv = 50.0
+        
+        # Produtibilidade equivalente (média ponderada pelo volume)
+        if volume_total > 0:
+            prod_equiv = sum(self.calcular_produtibilidade_instantanea(caso['UHE'][i], volumes[i]) * volumes[i] 
+                           for i in uhes_reservatorio) / volume_total
+        else:
+            prod_equiv = 0.7
+        
+        # Engolimento equivalente
+        engol_equiv = sum(caso['UHE'][i]['Engol'] for i in uhes_reservatorio)
+        
+        # =============================================================================
+        # 2. CURVA COTA-VOLUME EQUIVALENTE (aproximação linear)
+        # =============================================================================
+        
+        # Para o equivalente, usamos uma curva linear simplificada
+        # cota = a + b * volume
+        vol_min_equiv = sum(caso['UHE'][i]['Vmin'] for i in uhes_reservatorio)
+        vol_max_equiv = sum(caso['UHE'][i]['Vmax'] for i in uhes_reservatorio)
+        
+        # Calcular cotas nos pontos mínimo e máximo
+        cota_min = sum(self.calcular_cota_reservatorio(caso['UHE'][i], caso['UHE'][i]['Vmin']) 
+                      for i in uhes_reservatorio) / len(uhes_reservatorio)
+        
+        cota_max = sum(self.calcular_cota_reservatorio(caso['UHE'][i], caso['UHE'][i]['Vmax']) 
+                      for i in uhes_reservatorio) / len(uhes_reservatorio)
+        
+        # Coeficientes da reta
+        b_equiv = (cota_max - cota_min) / (vol_max_equiv - vol_min_equiv) if (vol_max_equiv - vol_min_equiv) > 0 else 0
+        a_equiv = cota_min - b_equiv * vol_min_equiv
+        
+        # =============================================================================
+        # 3. PRODUTIBILIDADE EQUIVALENTE EM FUNÇÃO DO VOLUME
+        # =============================================================================
+        
+        # Para o equivalente, a produtibilidade varia linearmente com o volume
+        # ρ = c + d * volume
+        
+        # Calcular produtibilidades nos pontos mínimo e máximo
+        prod_min = sum(self.calcular_produtibilidade_instantanea(caso['UHE'][i], caso['UHE'][i]['Vmin']) 
+                      for i in uhes_reservatorio) / len(uhes_reservatorio)
+        prod_max = sum(self.calcular_produtibilidade_instantanea(caso['UHE'][i], caso['UHE'][i]['Vmax']) 
+                      for i in uhes_reservatorio) / len(uhes_reservatorio)
+        
+        d_equiv = (prod_max - prod_min) / (vol_max_equiv - vol_min_equiv) if (vol_max_equiv - vol_min_equiv) > 0 else 0
+        c_equiv = prod_min - d_equiv * vol_min_equiv
+        
+        equivalente = {
+            # Grandezas básicas
+            'volume_total': volume_total,
+            'energia_armazenada': energia_total,
+            'produtibilidade_equivalente': prod_equiv,
+            'cota_equivalente': cota_equiv,
+            'altura_queda_equivalente': altura_equiv,
+            'engolimento_equivalente': engol_equiv,
+            
+            # Curvas equivalentes
+            'CotaVol_equiv': {'a': a_equiv, 'b': b_equiv},
+            'ProdVol_equiv': {'c': c_equiv, 'd': d_equiv},
+            
+            # Informações de agregação
+            'usinas_agregadas': uhes_reservatorio,
+            'usinas_fiodagua': uhes_fiodagua,
+            'volumes_individuais': [volumes[i] for i in uhes_reservatorio],
+            
+            # Limites
+            'Vmin_equiv': vol_min_equiv,
+            'Vmax_equiv': vol_max_equiv,
+            'ProdMin_equiv': max(prod_min, 0.1),
+            'ProdMax_equiv': min(prod_max, 1.5)
+        }
+        
+        return equivalente
+    
+    def calcular_produtibilidade_equivalente(self, equivalente, volume_equiv):
+        """Calcula produtibilidade do reservatório equivalente em função do volume"""
+        pv = equivalente['ProdVol_equiv']
+        prod = pv['c'] + pv['d'] * volume_equiv
+        return max(equivalente['ProdMin_equiv'], min(prod, equivalente['ProdMax_equiv']))
+    
+    def calcular_energia_armazenada_equivalente(self, equivalente, volume_equiv):
+        """Calcula energia armazenada do equivalente integrando a produtibilidade"""
+        # Para curva linear, a energia é a integral: E = ∫ (c + d*v) dv = c*v + d*v²/2
+        pv = equivalente['ProdVol_equiv']
+        energia = (pv['c'] * volume_equiv + pv['d'] * volume_equiv**2 / 2)
+        return max(energia, 0.0)
+    
+    def processar_resultados_equivalentes(self, model, caso, equivalente, volume_inicial):
+        """Processa resultados do modelo equivalente"""
+        
+        volumes_finais = []
+        turbinamentos = []
+        vertimentos = []
+        
+        # Distribuir resultados do equivalente para as usinas individuais
+        for i, uhe in enumerate(caso['UHE']):
+            if uhe['Reservatorio']:
+                # Distribuição proporcional baseada no volume inicial
+                proporcao = volume_inicial[i] / equivalente['volume_total'] if equivalente['volume_total'] > 0 else 0
+                vol_final = value(model.x_volume_final_equiv) * proporcao
+                turb = value(model.x_volume_turbinado_equiv) * proporcao
+                vert = value(model.x_volume_vertido_equiv) * proporcao
+            else:
+                # Fio d'água
+                vol_final = 0.0
+                turb = value(model.x_volume_turbinado_fiodagua[i])
+                vert = value(model.x_volume_vertido_fiodagua[i])
+            
+            volumes_finais.append(vol_final)
+            turbinamentos.append(turb)
+            vertimentos.append(vert)
+        
+        # Calcular geração térmica
+        geracao_termica = [value(model.x_geracao_termica[i]) for i in model.UTE]
+        
+        # Calcular custos
+        custo_imediato = 0
+        for i in model.UTE:
+            custo_imediato += value(model.x_geracao_termica[i]) * caso['UTE'][value(i)]['Custo']
+        custo_imediato += value(model.x_deficit) * caso['DGer']['CDef']
+        custo_imediato += 0.001 * value(model.x_volume_vertido_equiv)
+        
+        custo_futuro = value(model.x_alpha)
+        
+        return {
+            'status': 'optimal',
+            'custo_imediato': max(0, custo_imediato),
+            'custo_futuro': max(0, custo_futuro),
+            'cma_duais': [-0.1] * len(caso['UHE']),  # Aproximado
+            'cmo_dual': caso['DGer']['CDef'] * 0.5,  # Aproximado
+            'volumes_finais': volumes_finais,
+            'geracao_termica': geracao_termica,
+            'turbinamento': turbinamentos,
+            'vertimento': vertimentos,
+            'deficit': value(model.x_deficit),
+            'equivalente': equivalente
+        }
+
     def executar_pdde(self, caso):
-        print("=== PDDE ===")
+        print("=== PDDE com Reservatório Equivalente de Energia ===")
         
         # Configurações
         NCEN = caso['DGer']['Nr_Cen']
@@ -90,14 +329,17 @@ class PDDE:
 
         print(f"Sistema: {NUHE} UHEs, {NUTE} UTE, {NEST} estágios, {NCEN} cenários")
         
-        # Identificar usinas com reservatório para discretização
-        uhes_reservatorio = [i for i, uhe in enumerate(caso['UHE']) if uhe['Reservatorio'] == True]
+        # Identificar usinas com reservatório
+        uhes_reservatorio = [i for i, uhe in enumerate(caso['UHE']) if uhe['Reservatorio']]
         NUHE_RESERV = len(uhes_reservatorio)
         
         print(f"Usinas com reservatório: {NUHE_RESERV}")
-        print(f"Usina fio d'água: {[i for i, uhe in enumerate(caso['UHE']) if uhe['Reservatorio'] == False]}")
+        print(f"Usina fio d'água: {[i for i, uhe in enumerate(caso['UHE']) if not uhe['Reservatorio']]}")
         
-        # Discretização apenas para usinas com reservatório
+        # Plotar curvas equivalentes antes de executar
+        self.plotar_curvas_equivalentes(caso)
+        
+        # Discretização para reservatórios
         disc_arrays = [np.linspace(30, 70, NDISC) for _ in range(NUHE_RESERV)]
         discretizacoes = list(product(*disc_arrays))
         print(f"Pontos de discretização: {len(discretizacoes)}")
@@ -109,17 +351,14 @@ class PDDE:
             print(f"\n*** ESTÁGIO {iest} ***")
             print(f"{'='*50}")
             
-            # Cortes dos estágios futuros
             cortes_futuros = [c for c in listaDeCortes if c['estagio'] > iest]
             print(f"Cortes futuros carregados: {len(cortes_futuros)}")
             
             cortes_estagio_atual = []
             
             for idx, discretizacao in enumerate(discretizacoes):
-                # Inicializar todos os volumes como zero
                 volume_inicial = [0.0] * NUHE
                 
-                # Preencher apenas usinas com reservatório
                 for j, uhe_idx in enumerate(uhes_reservatorio):
                     usi = caso['UHE'][uhe_idx]
                     vol = usi['Vmin'] + ((usi['Vmax'] - usi['Vmin']) * discretizacao[j] / 100)
@@ -129,49 +368,43 @@ class PDDE:
                 reserv_volumes = [f'{volume_inicial[i]:.1f}' for i in uhes_reservatorio]
                 print(f"    Volume Inicial Reservatórios = {reserv_volumes}")
                 
+                # Calcular equivalente para debug
+                equivalente = self.criar_reservatorio_equivalente(caso, volume_inicial)
+                print(f"    Equivalente - Volume: {equivalente['volume_total']:.1f} hm³, "
+                      f"Prod: {equivalente['produtibilidade_equivalente']:.3f} MW/m³/s")
+                
                 custo_total_acum = 0.0
                 cma_duais_acum = np.zeros(NUHE)
                 cmo_duais_acum = 0.0
                 cenarios_validos = 0
                 
-                # Loop sobre cenários de afluência
                 for icen in range(NCEN):
-                    afluencia = []
+                    aflu = []
                     for i, usi in enumerate(caso['UHE']):
-                        afluencia.append(usi['Afl'][iest-1][icen])
+                        aflu.append(usi['Afl'][iest-1][icen])
                     
-                    print(f"    Afluencia = {afluencia}")
+                    print(f"    Afluencia = {aflu}")
                     
                     resultado = self.solve_DespachoEconomico(
-                        volume_inicial, afluencia, NUHE, NUTE, iest, caso, cortes_futuros
+                        volume_inicial, aflu, NUHE, NUTE, iest, caso, cortes_futuros
                     )
                     
-                    if resultado['status'] == 'optimal':
+                    if resultado is not None and resultado['status'] == 'optimal':
                         custo_cenario = resultado['custo_imediato'] + resultado['custo_futuro']
-                        custo_cenario = max(0.0, custo_cenario)
                         custo_total_acum += custo_cenario
-                        
-                        # Usar os duais reais das restrições de balanço hídrico
-                        for i in range(NUHE):
-                            if caso['UHE'][i]['Reservatorio'] == True:
-                                # Coeficiente NEGATIVO: quanto mais água, menor o custo futuro
-                                cma_duais_acum[i] += -abs(resultado['cma_duais'][i])
-                        
-                        cmo_duais_acum += max(0.0, resultado['cmo_dual'])
+                        cma_duais_acum += resultado['cma_duais']
+                        cmo_duais_acum += resultado['cmo_dual']
                         cenarios_validos += 1
                         
-                        # ADICIONAR AO RELATÓRIO
-                        self.adicionar_ao_relatorio(iest, idx, icen, volume_inicial, afluencia, resultado, caso)
+                        self.adicionar_ao_relatorio(iest, idx, icen, volume_inicial, aflu, resultado, caso)
                         
                         print(f"    Custo total: {custo_cenario:.2f}")
                         print(f"    Déficit: {resultado['deficit']:.2f}")
-                        print(f"    CMA duais: {[f'{c:.4f}' for c in resultado['cma_duais']]}")
                     else:
                         print(f"    SOLUÇÃO NÃO ÓTIMA!")
                         custo_total_acum += 1e6
                         cenarios_validos += 1
                 
-                # Calcula médias
                 if cenarios_validos > 0:
                     custo_medio = custo_total_acum / cenarios_validos
                     cma_medio = cma_duais_acum / cenarios_validos
@@ -179,48 +412,37 @@ class PDDE:
                 else:
                     custo_medio = 1e6
                     cma_medio = np.zeros(NUHE)
-                    for i in uhes_reservatorio:
-                        cma_medio[i] = -10.0
                     cmo_medio = caso['DGer']['CDef']
                 
-                # Cálculo robusto do termo independente
-                termo_independente = custo_medio
-                for i in uhes_reservatorio:
-                    termo_independente -= cma_medio[i] * volume_inicial[i]
+                # Calcular coeficiente para o equivalente
+                vol_equiv = equivalente['volume_total']
+                coef_equiv = -0.1  # Coeficiente aproximado
                 
-                # Garantir termo não-negativo
+                termo_independente = custo_medio - coef_equiv * vol_equiv
                 termo_independente = max(0.0, termo_independente)
-                
-                # Coeficientes apenas para reservatórios
-                coefs_corte = [cma_medio[i] if caso['UHE'][i]['Reservatorio'] == True else 0.0 
-                              for i in range(NUHE)]
                 
                 corte = {
                     'estagio': iest,
-                    'coefs': coefs_corte,
+                    'coefs': cma_medio.tolist(),
+                    'coef_equiv': coef_equiv,
                     'termo_independente': termo_independente,
                     'volume_inicial': volume_inicial.copy(),
                     'custo_medio': custo_medio,
-                    'cmo_medio': cmo_medio
+                    'cmo_medio': cmo_medio,
+                    'equivalente': equivalente
                 }
                 
                 cortes_estagio_atual.append(corte)
                 listaDeCortes.append(corte)
                 
-                print(f"    Corte gerado:")
-                print(f"    Coefs Reservatórios: {[f'{cma_medio[i]:.6f}' for i in uhes_reservatorio]}")
-                print(f"    Termo indep: {termo_independente:.6f}")
-                print(f"    Custo médio: {custo_medio:.6f}")
+                print(f"    Corte gerado - Coef Equiv: {coef_equiv:.6f}, Termo: {termo_independente:.6f}")
             
-            # Plotagem 3D apenas para as 2 usinas com reservatório
             if NUHE_RESERV == 2:
                 print(f"\nPlotando superfície de custo futuro para estágio {iest}...")
                 self.plota_FuncaoCustoFuturo_3D(listaDeCortes, caso, iest, uhes_reservatorio)
             
-            # Gerar relatório do estágio atual
             self.gerar_relatorio_estagio(iest, caso)
         
-        # Gerar relatório final consolidado
         self.gerar_relatorio_final(caso)
 
     def adicionar_ao_relatorio(self, estagio, ponto_discretizacao, cenario, volume_inicial, afluencia, resultado, caso):
@@ -239,15 +461,103 @@ class PDDE:
             'deficit': resultado['deficit'],
             'custo_imediato': resultado['custo_imediato'],
             'custo_futuro': resultado['custo_futuro'],
-            'custo_total': resultado['custo_imediato'] + resultado['custo_futuro']
+            'custo_total': resultado['custo_imediato'] + resultado['custo_futuro'],
+            'equivalente': resultado.get('equivalente', {})
         }
         
-        # Calcular geração das UHEs (turbinamento * produtibilidade)
+        # Calcular geração das UHEs considerando produtibilidade variável
         for i, uhe in enumerate(caso['UHE']):
-            geracao = resultado['turbinamento'][i] * uhe['Prod']
+            if uhe['Reservatorio']:
+                prod = self.calcular_produtibilidade_instantanea(uhe, resultado['volumes_finais'][i])
+            else:
+                prod = uhe['Prod']
+            geracao = resultado['turbinamento'][i] * prod
             entrada['geracao_uhe'].append(geracao)
         
         self.relatorio_completo.append(entrada)
+
+    def plotar_curvas_equivalentes(self, caso):
+        """Plota as curvas do reservatório equivalente"""
+        # Testar com volumes médios
+        volumes_test = [50.0, 60.0, 40.0,]  # Volumes de teste
+        equivalente = self.criar_reservatorio_equivalente(caso, volumes_test)
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. Curva cota-volume equivalente
+        vol_range = np.linspace(equivalente['Vmin_equiv'], equivalente['Vmax_equiv'], 50)
+        cotas_equiv = [equivalente['CotaVol_equiv']['a'] + equivalente['CotaVol_equiv']['b'] * v 
+                      for v in vol_range]
+        
+        axes[0,0].plot(vol_range, cotas_equiv, 'b-', linewidth=2, label='Equivalente')
+        
+        # Plotar curvas individuais para comparação
+        for i in equivalente['usinas_agregadas']:
+            uhe = caso['UHE'][i]
+            vol_uhe = np.linspace(uhe['Vmin'], uhe['Vmax'], 50)
+            cotas_uhe = [self.calcular_cota_reservatorio(uhe, v) for v in vol_uhe]
+            axes[0,0].plot(vol_uhe, cotas_uhe, '--', alpha=0.7, label=f'UHE {i+1}')
+        
+        axes[0,0].set_xlabel('Volume (hm³)')
+        axes[0,0].set_ylabel('Cota (m)')
+        axes[0,0].set_title('Curva Cota-Volume Equivalente')
+        axes[0,0].legend()
+        axes[0,0].grid(True, alpha=0.3)
+        
+        # 2. Curva produtibilidade-volume equivalente
+        prod_equiv = [self.calcular_produtibilidade_equivalente(equivalente, v) for v in vol_range]
+        
+        axes[0,1].plot(vol_range, prod_equiv, 'r-', linewidth=2, label='Equivalente')
+        
+        # Plotar curvas individuais
+        for i in equivalente['usinas_agregadas']:
+            uhe = caso['UHE'][i]
+            vol_uhe = np.linspace(uhe['Vmin'], uhe['Vmax'], 50)
+            prod_uhe = [self.calcular_produtibilidade_instantanea(uhe, v) for v in vol_uhe]
+            axes[0,1].plot(vol_uhe, prod_uhe, '--', alpha=0.7, label=f'UHE {i+1}')
+        
+        axes[0,1].set_xlabel('Volume (hm³)')
+        axes[0,1].set_ylabel('Produtibilidade (MW/m³/s)')
+        axes[0,1].set_title('Curva Produtibilidade-Volume Equivalente')
+        axes[0,1].legend()
+        axes[0,1].grid(True, alpha=0.3)
+        
+        # 3. Curva energia-volume equivalente
+        energia_equiv = [self.calcular_energia_armazenada_equivalente(equivalente, v) for v in vol_range]
+        
+        axes[1,0].plot(vol_range, energia_equiv, 'g-', linewidth=2, label='Equivalente')
+        
+        # Plotar curvas individuais
+        for i in equivalente['usinas_agregadas']:
+            uhe = caso['UHE'][i]
+            vol_uhe = np.linspace(uhe['Vmin'], uhe['Vmax'], 50)
+            energia_uhe = [self.calcular_energia_armazenada(uhe, v) for v in vol_uhe]
+            axes[1,0].plot(vol_uhe, energia_uhe, '--', alpha=0.7, label=f'UHE {i+1}')
+        
+        axes[1,0].set_xlabel('Volume (hm³)')
+        axes[1,0].set_ylabel('Energia Armazenada (MWmes)')
+        axes[1,0].set_title('Curva Energia-Volume Equivalente')
+        axes[1,0].legend()
+        axes[1,0].grid(True, alpha=0.3)
+        
+        # 4. Resumo do equivalente
+        axes[1,1].axis('off')
+        info_text = (
+            f"Reservatório Equivalente - Resumo\n\n"
+            f"Volume Total: {equivalente['volume_total']:.1f} hm³\n"
+            f"Energia Armazenada: {equivalente['energia_armazenada']:.1f} MWmes\n"
+            f"Produtibilidade Equivalente: {equivalente['produtibilidade_equivalente']:.3f} MW/m³/s\n"
+            f"Cota Equivalente: {equivalente['cota_equivalente']:.1f} m\n"
+            f"Altura Queda Equivalente: {equivalente['altura_queda_equivalente']:.1f} m\n"
+            f"Engolimento Equivalente: {equivalente['engolimento_equivalente']:.1f} m³/s\n"
+            f"Usinas Agregadas: {len(equivalente['usinas_agregadas'])}\n"
+            f"Usinas Fio d'Água: {len(equivalente['usinas_fiodagua'])}"
+        )
+        axes[1,1].text(0.1, 0.9, info_text, transform=axes[1,1].transAxes, fontsize=12,
+                      verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        plt.tight_layout()
+        plt.show()
 
     def gerar_relatorio_estagio(self, estagio, caso):
         """Gera relatório detalhado para um estágio específico"""
@@ -554,10 +864,9 @@ class PDDE:
 
         except Exception as e:
             print(f"  Erro na otimização: {e}")
-        
 
     def plota_FuncaoCustoFuturo_3D(self, cortes, caso, imes, uhes_reservatorio):
-        """Plota a função de custo futuro como superfície 3D para as 2 usinas com reservatório"""
+        """Plota a função de custo futuro como superfície 3D considerando o reservatório equivalente"""
         if len(uhes_reservatorio) != 2:
             print("Plot 3D requer exatamente 2 usinas com reservatório")
             return False
@@ -577,7 +886,7 @@ class PDDE:
         uhe2_range = np.linspace(caso['UHE'][uhe2_idx]['Vmin'], caso['UHE'][uhe2_idx]['Vmax'], 30)
         UHE1, UHE2 = np.meshgrid(uhe1_range, uhe2_range)
         
-        # Calcula Z (custo futuro) para cada ponto do grid
+        # Calcula Z (custo futuro) para cada ponto do grid considerando o equivalente
         Z = np.zeros_like(UHE1)
         
         for i in range(UHE1.shape[0]):
@@ -585,17 +894,26 @@ class PDDE:
                 volume_uhe1 = UHE1[i, j]
                 volume_uhe2 = UHE2[i, j]
                 
-                # Para calcular o custo futuro, usamos volumes fixos para as reservatórios
+                # Criar volumes iniciais para o ponto do grid
                 VOL_FIXO = [0.0] * len(caso['UHE'])
                 VOL_FIXO[uhe1_idx] = volume_uhe1
                 VOL_FIXO[uhe2_idx] = volume_uhe2
                 
-                # Calcula valor de cada corte neste ponto
+                # Calcular o reservatório equivalente para este ponto
+                equivalente = self.criar_reservatorio_equivalente(caso, VOL_FIXO)
+                volume_equiv = equivalente['volume_total']
+                
+                # Calcula valor de cada corte neste ponto usando o coeficiente equivalente
                 valores_cortes = []
                 for corte in cortes_estagio:
-                    valor = corte['termo_independente']
-                    for k in range(len(corte['coefs'])):
-                        valor += corte['coefs'][k] * VOL_FIXO[k]
+                    # Usar o coeficiente equivalente se disponível, senão usar a média dos coeficientes individuais
+                    if 'coef_equiv' in corte:
+                        valor = corte['coef_equiv'] * volume_equiv + corte['termo_independente']
+                    else:
+                        # Fallback: usar média dos coeficientes das UHEs individuais
+                        coef_medio = (corte['coefs'][uhe1_idx] + corte['coefs'][uhe2_idx]) / 2
+                        valor = coef_medio * volume_equiv + corte['termo_independente']
+                    
                     valores_cortes.append(max(0.0, valor))
                 
                 # Função de custo futuro é o máximo dos cortes
@@ -605,14 +923,16 @@ class PDDE:
         Z = np.maximum(Z, 0.0)
         
         # Plot 3D
-        fig = plt.figure(figsize=(15, 10))
-        ax = fig.add_subplot(111, projection='3d')
+        fig = plt.figure(figsize=(16, 12))
+        
+        # Subplot 1: Superfície de custo
+        ax1 = fig.add_subplot(projection='3d')
         
         # Plota superfície
-        surf = ax.plot_surface(UHE1, UHE2, Z, cmap='plasma', alpha=0.8, 
+        surf = ax1.plot_surface(UHE1, UHE2, Z, cmap='plasma', alpha=0.8, 
                             linewidth=0, antialiased=True)
         
-        # ADIÇÃO: Scatter plot dos pontos calculados (volume_uhe1, volume_uhe2, custo)
+        # Scatter plot dos pontos calculados
         x_points = []
         y_points = []
         z_points = []
@@ -622,30 +942,130 @@ class PDDE:
             y_points.append(corte['volume_inicial'][uhe2_idx])
             z_points.append(corte['custo_medio'])
         
-        ax.scatter(x_points, y_points, z_points, color='red', s=50, alpha=0.9, label='Pontos Calculados')
+        ax1.scatter(x_points, y_points, z_points, color='red', s=50, alpha=0.9, 
+                label='Pontos de Discretização')
         
         # Configurações do gráfico
-        ax.set_xlabel(f'Volume Final {caso["UHE"][uhe1_idx]["Nome"].split(" - ")[0]} [hm³]', fontsize=12, labelpad=10)
-        ax.set_ylabel(f'Volume Final {caso["UHE"][uhe2_idx]["Nome"].split(" - ")[0]} [hm³]', fontsize=12, labelpad=10)
-        ax.set_zlabel('Custo Futuro Esperado', fontsize=12, labelpad=10)
-        ax.set_title(f'Função de Custo Futuro - Estágio {imes}\n', 
-                    fontsize=14, fontweight='bold', pad=10)
+        ax1.set_xlabel(f'Volume {caso["UHE"][uhe1_idx]["Nome"].split(" - ")[0]} [hm³]', 
+                    fontsize=10, labelpad=10)
+        ax1.set_ylabel(f'Volume {caso["UHE"][uhe2_idx]["Nome"].split(" - ")[0]} [hm³]', 
+                    fontsize=10, labelpad=10)
+        ax1.set_zlabel('Custo Futuro Esperado [R$]', fontsize=10, labelpad=10)
+        ax1.set_title(f'Função de Custo Futuro - Estágio {imes}\n(Reservatório Equivalente)', 
+                    fontsize=12, fontweight='bold', pad=15)
         
-        # Definir limite inferior do eixo Z como 0
-        ax.set_zlim(bottom=0)
+        ax1.set_zlim(bottom=0)
+        fig.colorbar(surf, ax=ax1, shrink=0.6, aspect=20, pad=0.1, label='Custo [R$]')
+        ax1.legend()
+        ax1.view_init(elev=25, azim=225)
         
-        # Adiciona barra de cores
-        fig.colorbar(surf, ax=ax, shrink=0.5, aspect=20, pad=0.1)
+        # # Subplot 2: Curvas de nível
+        # ax2 = fig.add_subplot(122)
         
-        # ADIÇÃO: Legenda
-        ax.legend()
+        # # Plotar curvas de nível
+        # contour = ax2.contourf(UHE1, UHE2, Z, levels=20, cmap='plasma')
+        # ax2.contour(UHE1, UHE2, Z, levels=10, colors='black', alpha=0.3, linewidths=0.5)
         
-        # Ajusta ângulo de visualização
-        ax.view_init(elev=25, azim=225)
+        # # Pontos de discretização
+        # ax2.scatter(x_points, y_points, color='red', s=30, alpha=0.8, 
+        #         label='Pontos Calculados')
+        
+        # ax2.set_xlabel(f'Volume {caso["UHE"][uhe1_idx]["Nome"].split(" - ")[0]} [hm³]', fontsize=10)
+        # ax2.set_ylabel(f'Volume {caso["UHE"][uhe2_idx]["Nome"].split(" - ")[0]} [hm³]', fontsize=10)
+        # ax2.set_title(f'Curvas de Nível - Estágio {imes}\n(Reservatório Equivalente)', 
+        #             fontsize=12, fontweight='bold', pad=15)
+        # ax2.grid(True, alpha=0.3)
+        # ax2.legend()
+        
+        # # Adicionar barra de cores para as curvas de nível
+        # cbar = plt.colorbar(contour, ax=ax2, shrink=0.8)
+        # cbar.set_label('Custo Futuro [R$]', fontsize=10)
+        
+        # Adicionar informações do reservatório equivalente
+        if cortes_estagio and 'equivalente' in cortes_estagio[0]:
+            equiv_info = cortes_estagio[0]['equivalente']
+            info_text = (
+                f"Reservatório Equivalente:\n"
+                f"• Volume: {equiv_info['volume_total']:.1f} hm³\n"
+                f"• Produtibilidade: {equiv_info['produtibilidade_equivalente']:.3f}\n"
+                f"• Altura Queda: {equiv_info['altura_queda_equivalente']:.1f} m\n"
+                f"• Cortes: {len(cortes_estagio)}"
+            )
+            
+            # Adicionar caixa de texto no gráfico de superfície
+            ax1.text2D(0.02, 0.98, info_text, transform=ax1.transAxes, fontsize=9,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            # # Adicionar no gráfico de contorno também
+            # ax2.text(0.02, 0.98, info_text, transform=ax2.transAxes, fontsize=9,
+            #         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         plt.tight_layout()
         plt.show()
+        
+        # Plot adicional: Mostrar a relação entre volume equivalente e custo futuro
+        self.plota_curva_custo_volume_equivalente(cortes_estagio, imes)
+        
         return True
+
+    def plota_curva_custo_volume_equivalente(self, cortes_estagio, imes):
+        """Plota curva mostrando relação entre volume equivalente e custo futuro"""
+        if not cortes_estagio or 'equivalente' not in cortes_estagio[0]:
+            return
+        
+        # Extrair volumes equivalentes e custos
+        volumes_equiv = []
+        custos = []
+        
+        for corte in cortes_estagio:
+            if 'equivalente' in corte:
+                equiv = corte['equivalente']
+                volumes_equiv.append(equiv['volume_total'])
+                custos.append(corte['custo_medio'])
+        
+        if not volumes_equiv:
+            return
+        
+        # Ordenar por volume para melhor visualização
+        sorted_data = sorted(zip(volumes_equiv, custos))
+        volumes_sorted, custos_sorted = zip(*sorted_data)
+        
+        # Criar figura
+        plt.figure(figsize=(10, 6))
+        
+        # Plotar pontos
+        plt.scatter(volumes_sorted, custos_sorted, color='blue', s=50, alpha=0.7, 
+                label='Pontos de Discretização')
+        
+        # Tentar ajustar uma curva suave
+        if len(volumes_sorted) > 3:
+            # Interpolação suave
+            from scipy.interpolate import interp1d
+            x_smooth = np.linspace(min(volumes_sorted), max(volumes_sorted), 100)
+            try:
+                f = interp1d(volumes_sorted, custos_sorted, kind='cubic', fill_value='extrapolate')
+                y_smooth = f(x_smooth)
+                plt.plot(x_smooth, y_smooth, 'r-', linewidth=2, alpha=0.8, label='Tendência')
+            except:
+                # Fallback para linear se cubic falhar
+                plt.plot(volumes_sorted, custos_sorted, 'r--', linewidth=2, alpha=0.8, label='Tendência')
+        
+        plt.xlabel('Volume Equivalente [hm³]', fontsize=12)
+        plt.ylabel('Custo Futuro Esperado [R$]', fontsize=12)
+        plt.title(f'Relação Volume Equivalente vs Custo Futuro\nEstágio {imes}', 
+                fontsize=14, fontweight='bold', pad=15)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        
+        # Adicionar informações estatísticas
+        if len(volumes_sorted) > 1:
+            correlacao = np.corrcoef(volumes_sorted, custos_sorted)[0,1]
+            info_text = f'Correlação: {correlacao:.3f}'
+            plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes, fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.show()
 
 if __name__ == '__main__':
     # Executa o PDDE
